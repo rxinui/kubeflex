@@ -46,16 +46,59 @@ const (
 	ExtensionLabelManageByKubeflex     = "kubeflex.dev/is-managed"
 	ControlPlaneTypeOCMDefault         = "multicluster-controlplane"
 	ControlPlaneTypeVClusterDefault    = "my-vcluster"
+	TypeExtensionDefault               = "extensions"
+	TypeExtensionLegacy                = "preferences[].extensions"
 )
 
-func unMarshallCM(obj runtime.Object) (*corev1.ConfigMap, error) {
-	jsonData, err := json.Marshal(obj)
-	if err != nil {
-		return nil, fmt.Errorf("error marshaling object %s", err)
+type RuntimeKubeflexConfigExtension corev1.ConfigMap
+
+// Get data wrapped inside the runtime kubeflex config extension
+func (runtimeKflexExtension RuntimeKubeflexConfigExtension) GetString(field string) (string, bool) {
+	if value, ok := runtimeKflexExtension.Data[field]; ok {
+		return value, true
 	}
-	cm := corev1.ConfigMap{}
-	json.Unmarshal(jsonData, &cm)
-	return &cm, nil
+	return "", false
+}
+
+type KubeflexConfigExtensions struct {
+	kconf          clientcmdapi.Config
+	Extensions     map[string]runtime.Object
+	ExtensionsType string
+}
+
+type KubeflexConfigExtensionOption func(*KubeflexConfigExtensions)
+
+// Create a new KubeflexConfigExtensionsGet extensions with precedence rules
+// It first lookup for `TypeExtensionDefault` (global) and if not found
+// lookup to `TypeExtensionLegacy` (legacy and deprecated usage)
+// Return the extension data found else an error
+func NewKubeflexConfigExtensions(kconf clientcmdapi.Config, options ...KubeflexConfigExtensionOption) (*KubeflexConfigExtensions, error) {
+	kflexExtensions := &KubeflexConfigExtensions{kconf: kconf}
+	// Precedences of extensions
+	if kconf.Extensions != nil {
+		// Extensions from newer kubeflex version
+		kflexExtensions.Extensions = kconf.Extensions
+		kflexExtensions.ExtensionsType = TypeExtensionDefault
+	} else if kconf.Preferences.Extensions != nil {
+		// Legacy and deprecated extensions
+		kflexExtensions.Extensions = kconf.Preferences.Extensions
+		kflexExtensions.ExtensionsType = TypeExtensionLegacy
+	} else {
+		return nil, fmt.Errorf("kubeconfig has no extensions defined which is required by kubeflex")
+	}
+	return kflexExtensions, nil
+}
+
+func (kflexExtensions KubeflexConfigExtensions) UnmarshalExtension(extension string, receiver RuntimeKubeflexConfigExtension) error {
+	if extensionValues, ok := kflexExtensions.Extensions[extension]; ok {
+		jsonData, err := json.Marshal(extensionValues)
+		if err != nil {
+			return fmt.Errorf("error marshaling object %s", err)
+		}
+		json.Unmarshal(jsonData, receiver)
+		return nil
+	}
+	return fmt.Errorf("extension '%s' is not defined in kubeconfig within '%s'", extension, kflexExtensions.ExtensionsType)
 }
 
 func adjustConfigKeys(config *clientcmdapi.Config, cpName, controlPlaneType string) {
@@ -119,8 +162,8 @@ func merge(base, target *clientcmdapi.Config) error {
 		base.Contexts[k] = v
 	}
 
-	if !IsHostingClusterContextPreferenceSet(base) {
-		SetHostingClusterContextPreference(base, nil)
+	if !IsHostingClusterContextSet(base) {
+		SetHostingClusterContext(base, nil)
 	}
 
 	// set the current context to the nex context
@@ -187,33 +230,35 @@ func GetCurrentContext(kubeconfig string) (string, error) {
 
 // Get hosting cluster context value set in extensions
 func GetHostingClusterContext(config *clientcmdapi.Config) (string, error) {
-	cm, err := unMarshallCM(config.Preferences.Extensions[ExtensionConfigName])
+	kflexExtensions, err := NewKubeflexConfigExtensions(*config)
+	if err != nil {
+		return "", err
+	}
+	runtimeKflexConfig := RuntimeKubeflexConfigExtension{}
+	err = kflexExtensions.UnmarshalExtension(ExtensionConfigName, runtimeKflexConfig)
 	if err != nil {
 		return "", fmt.Errorf("error unmarshaling config map %s", err)
 	}
-
-	contextData, ok := cm.Data[ExtensionInitialContextName]
+	contextName, ok := runtimeKflexConfig.GetString(ExtensionInitialContextName)
 	if !ok {
-		return "", fmt.Errorf("hosting cluster preference context data not set")
+		return "", fmt.Errorf("hosting cluster context data not set")
 	}
-
 	// make sure that context set in extension is a valid context
-	_, ok = config.Contexts[contextData]
+	_, ok = config.Contexts[contextName]
 	if !ok {
-		return "", fmt.Errorf("hosting cluster preference context data is set to a non-existing context")
+		return "", fmt.Errorf("hosting cluster context data is set to a non-existing context")
 	}
-
-	return contextData, nil
+	return contextName, nil
 }
 
-func IsHostingClusterContextPreferenceSet(config *clientcmdapi.Config) bool {
-	if config.Preferences.Extensions != nil {
-		_, ok := config.Preferences.Extensions[ExtensionConfigName]
-		if ok {
-			return true
-		}
+// Check hosting cluster is set within loaded kubeconfig
+func IsHostingClusterContextSet(config *clientcmdapi.Config) bool {
+	kflexExtensions, err := NewKubeflexConfigExtensions(*config)
+	if err != nil {
+		return false
 	}
-	return false
+	_, ok := kflexExtensions.Extensions[ExtensionConfigName]
+	return ok
 }
 
 // List all contexts
@@ -286,24 +331,9 @@ func RenameKey(m interface{}, oldKey string, newKey string) {
 	}
 }
 
-// DISCUSSION: shouldn't we keep our functions as much low-level as possible?
-// Rather than having SaveHostingClusterContextPreference as a function
-// Shouldn't we use SetHostingClusterContextPreference and WriteKubeconfig
-// whenever it is required? It seem clearer to only have a single WRITE function
-// instead of SAVE function that embeds WRITE... (personal observation)
-func SaveHostingClusterContextPreference(kubeconfig string) error {
-	// TODO replace context parameter
-	kconfig, err := LoadKubeconfig(kubeconfig)
-	if err != nil {
-		return fmt.Errorf("setHostingClusterContextPreference: error loading kubeconfig %s", err)
-	}
-	SetHostingClusterContextPreference(kconfig, nil)
-	// TODO replace context parameter
-	return WriteKubeconfig(kubeconfig, kconfig)
-}
-
 // sets hosting cluster context to current context if userSuppliedContext is nil, otherwise set to userSuppliedContext
-func SetHostingClusterContextPreference(config *clientcmdapi.Config, userSuppliedContext *string) {
+func SetHostingClusterContext(config *clientcmdapi.Config, userSuppliedContext *string) {
+	// TODO
 	hostingContext := config.CurrentContext
 	if userSuppliedContext != nil {
 		hostingContext = *userSuppliedContext
@@ -336,8 +366,8 @@ func SwitchContext(config *clientcmdapi.Config, cpName string) error {
 
 // Switch to hosting cluster context
 func SwitchToHostingClusterContext(config *clientcmdapi.Config, removeExtension bool) error {
-	if !IsHostingClusterContextPreferenceSet(config) {
-		return fmt.Errorf("hosting cluster preference context not set")
+	if !IsHostingClusterContextSet(config) {
+		return fmt.Errorf("hosting cluster context not set")
 	}
 
 	// found that the only way to unmarshal the runtime.Object into a ConfigMap
@@ -419,7 +449,6 @@ func WaitForNamespaceReady(ctx context.Context, clientset kubernetes.Interface, 
 			return false, nil // Continue waiting
 		},
 	)
-
 	if err != nil {
 		return fmt.Errorf("timed out waiting for namespace %s to be ready: %v", namespace, err)
 	}

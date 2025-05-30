@@ -89,12 +89,12 @@ func (cpCtx *CPCtx) ExecuteCtx(chattyStatus, failIfNone, overwriteExistingCtx, s
 	if cpCtx.Name == "" {
 		// Switch to hosting cluster context when no context is provided
 		if setCurrentCtxAsHosting { // set hosting cluster context unconditionally to the current context
-			kubeconfig.SetHostingClusterContextPreference(kconf, nil)
+			kubeconfig.SetHostingClusterContext(kconf, nil)
 		}
 		util.PrintStatus("Checking for saved hosting cluster context...", done, &wg, chattyStatus)
 		time.Sleep(1 * time.Second)
 		done <- true
-		if kubeconfig.IsHostingClusterContextPreferenceSet(kconf) {
+		if kubeconfig.IsHostingClusterContextSet(kconf) {
 			util.PrintStatus("Switching to hosting cluster context...", done, &wg, chattyStatus)
 			if err = kubeconfig.SwitchToHostingClusterContext(kconf, false); err != nil {
 				return fmt.Errorf("error switching kubeconfig to hosting cluster context: %v", err)
@@ -114,7 +114,7 @@ func (cpCtx *CPCtx) ExecuteCtx(chattyStatus, failIfNone, overwriteExistingCtx, s
 
 			}
 			util.PrintStatus("Hosting cluster context not set, setting it to current context", done, &wg, chattyStatus)
-			kubeconfig.SetHostingClusterContextPreference(kconf, nil)
+			kubeconfig.SetHostingClusterContext(kconf, nil)
 			done <- true
 		}
 	} else {
@@ -198,7 +198,7 @@ func (cpCtx *CPCtx) loadAndMergeFromServer(kconfig *api.Config) error {
 }
 
 func (cpCtx *CPCtx) switchToHostingClusterContextAndWrite(kconf *api.Config) error {
-	if kubeconfig.IsHostingClusterContextPreferenceSet(kconf) {
+	if kubeconfig.IsHostingClusterContextSet(kconf) {
 		if err := kubeconfig.SwitchToHostingClusterContext(kconf, false); err != nil {
 			return err
 		}
